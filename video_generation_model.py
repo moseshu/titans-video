@@ -8,7 +8,7 @@ from einops import rearrange
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModel
 from world_model_reasoning import WorldModelReasoning
 import torch.nn.functional as F
-
+from einops import rearrange, repeat
 
 class TitansVideoGenerator(nn.Module):
     """
@@ -108,66 +108,100 @@ class TitansVideoGenerator(nn.Module):
 
     def forward(
             self,
-            latents: torch.Tensor,  # 噪声潜在表示
+            latents: torch.Tensor,  # Noisy Latents [B, T, 4, H, W]
             timesteps: torch.Tensor,
             text: Optional[list[str]] = None,
-            images: Optional[torch.Tensor] = None,
+            images: Optional[torch.Tensor] = None, # 参考图 [B, 3, H, W]
             history_latents: Optional[torch.Tensor] = None,
             entity_memory: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         前向传播
-
-        Args:
-            latents: [B, T, C, H, W] 噪声潜在表示
-            timesteps: [B] 时间步
-            text: 文本提示列表
-            images: [B, 3, H, W] 参考图像（可选）
-            history_latents: 历史帧潜在表示（用于长视频生成）
-            entity_memory: 实体记忆状态
         """
+        B, T, C, H, W = latents.shape
 
-        # 编码条件
+        # 1. 编码 Cross-Attention 条件 (Text/Image Embeddings)
         text_embeds = self.encode_text(text) if text is not None else None
         image_embeds = self.encode_image(images) if images is not None else None
 
-        # 转换维度以匹配UNet
-        B, T, C, H, W = latents.shape
-        latents_reasoning = rearrange(latents, 'b t c h w -> b t h w c')
-
-        # 世界模型推理
-        reasoned_latents, aux = self.world_model(
-            current_latents=latents_reasoning,
-            text_embeds=text_embeds,
-            image_embeds=image_embeds,
-            history_latents=history_latents,
-            entity_memory=entity_memory,
-        )
-
-        # 转回UNet维度
-        reasoned_latents = rearrange(reasoned_latents, 'b t h w c -> b t c h w')
-
-        # 融合原始和推理后的潜在表示
-        enhanced_latents = 0.7 * latents + 0.3 * reasoned_latents
-
-        # 准备条件嵌入
+        # 准备 Cross-Attention 输入 [B, 1, D]
         if text_embeds is not None and image_embeds is not None:
             condition_embeds = (text_embeds + image_embeds) / 2
         elif text_embeds is not None:
             condition_embeds = text_embeds
         else:
-            condition_embeds = image_embeds
+            # 如果都没有，必须有一个 fallback，通常 SVD 依赖 image_embeds
+            condition_embeds = image_embeds if image_embeds is not None else torch.zeros(B, 1024, device=latents.device)
 
-        condition_embeds = condition_embeds.unsqueeze(1)  # [B, 1, D]
+        if condition_embeds.ndim == 2:
+            condition_embeds = condition_embeds.unsqueeze(1)
 
-        # UNet预测噪声
+
+        if images is not None:
+            with torch.no_grad():
+                # 编码参考图: [B, 3, H, W] -> [B, 4, H/8, W/8]
+                # 注意：encode_video 需要处理 T 维度，这里 unsqueeze 模拟 T=1
+                clean_image_latents = self.encode_video(images.unsqueeze(1))
+
+                # 移除 T 维度，得到 [B, 4, H, W] 用于 SVD Concat
+                svd_image_cond_latents = clean_image_latents.squeeze(1)
+
+                # 重复到 T 用于 World Model 输入 [B, T, 4, H, W]
+                world_model_input = repeat(clean_image_latents, 'b 1 c h w -> b t c h w', t=T)
+        else:
+            # 纯文生视频模式 (无参考图)
+            world_model_input = torch.zeros_like(latents)
+            svd_image_cond_latents = torch.zeros(B, 4, H, W, device=latents.device)
+
+        # 3. 世界模型推理
+        reasoned_features, aux = self.world_model(
+            current_latents=world_model_input, # 使用 Clean Latents
+            text_embeds=text_embeds,
+            image_embeds=image_embeds,
+            history_latents=history_latents,
+            entity_memory=entity_memory
+        )
+
+        # 4. 融合策略
+        # 这里的策略是：利用物理推理结果，微调"噪声"输入，引导去噪方向
+        enhanced_noisy_latents = latents + 0.1 * reasoned_features
+
+        # 5. 构建 SVD UNet 的输入 (8通道)
+        # SVD UNet 需要输入: Concat([NoisyLatents, ConditionImageLatents])
+        # ConditionImageLatents 需要重复 T 次以匹配时间维度
+        svd_image_cond_latents_repeated = repeat(svd_image_cond_latents, 'b c h w -> b t c h w', t=T)
+
+        # 拼接: [B, T, 4, H, W] + [B, T, 4, H, W] -> [B, T, 8, H, W]
+        unet_input = torch.cat([enhanced_noisy_latents, svd_image_cond_latents_repeated], dim=2)
+
+        # 6. 生成 added_time_ids (FPS, Motion Bucket, Augmentation)
+        # 如果不传这个，SVD 会报错或效果极差
+        added_time_ids = self._get_add_time_ids(
+            B,
+            fps=7,
+            motion_bucket_id=127,
+            noise_aug_strength=0.02,
+            dtype=latents.dtype,
+            device=latents.device
+        )
+
+        # 7. UNet 预测
         noise_pred = self.unet(
-            enhanced_latents,
+            unet_input,
             timesteps,
             encoder_hidden_states=condition_embeds,
+            added_time_ids=added_time_ids, # 必须传入
         ).sample
 
         return noise_pred, aux
+
+    # --- 辅助函数：生成 SVD 必需的时间条件 ---
+    def _get_add_time_ids(self, batch_size, fps, motion_bucket_id, noise_aug_strength, dtype, device):
+        # SVD 默认的微调条件
+        add_time_ids = [fps, motion_bucket_id, noise_aug_strength]
+        add_time_ids = torch.tensor([add_time_ids], dtype=dtype, device=device)
+        add_time_ids = add_time_ids.repeat(batch_size, 1)
+        return add_time_ids
 
 
 class TitansVideoTrainer:

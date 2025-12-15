@@ -217,36 +217,36 @@ class TemporalConsistencyModule(nn.Module):
         return consistent_frame, entity_memory
 
 
+
 class WorldModelReasoning(nn.Module):
     """
-    世界模型推理模块 - 整合所有推理能力
+    高效版世界模型推理模块
     """
     def __init__(
-        self,
-        dim: int,
-        num_physics_rules: int = 128,
-        num_scenes: int = 256,
-        num_entities: int = 64,
-        memory_depth: int = 3,
-        reasoning_depth: int = 4,
-        consistency_depth: int = 3,
+            self,
+            dim: int,
+            num_physics_rules: int = 128,
+            num_scenes: int = 256,
+            num_entities: int = 64,
+            memory_depth: int = 3,
+            reasoning_depth: int = 4,
+            consistency_depth: int = 3,
     ):
         super().__init__()
-        
-        # 三大推理模块
-        self.physics_memory = PhysicsAwareMemory(
-            dim, num_physics_rules, memory_depth
+
+        # --- 1. 空间压缩模块 ---
+        # 将 64x64 的 latent 压缩到 16x16，节省 16倍 显存
+        self.spatial_reducer = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=4, stride=4),
+            nn.GroupNorm(32, dim),
+            nn.SiLU()
         )
-        
-        self.commonsense_reasoning = CommonSenseReasoning(
-            dim, num_scenes, reasoning_depth
-        )
-        
-        self.consistency_module = TemporalConsistencyModule(
-            dim, num_entities, consistency_depth
-        )
-        
-        # 多模态融合
+
+        # --- 2. 核心推理模块 ---
+        self.physics_memory = PhysicsAwareMemory(dim, num_physics_rules, memory_depth)
+        self.commonsense_reasoning = CommonSenseReasoning(dim, num_scenes, reasoning_depth)
+        self.consistency_module = TemporalConsistencyModule(dim, num_entities, consistency_depth)
+
         self.fusion_layers = nn.ModuleList([
             nn.Sequential(
                 nn.LayerNorm(dim),
@@ -254,81 +254,102 @@ class WorldModelReasoning(nn.Module):
                 nn.GELU(),
                 nn.Dropout(0.1),
                 nn.Linear(dim * 4, dim),
-            ) for _ in range(3)
+            ) for _ in range(2) # 稍微减少层数以换取效率
         ])
-        
-        # 自适应门控
+
         self.adaptive_gate = nn.Sequential(
             nn.Linear(dim * 3, 3),
             nn.Softmax(dim=-1),
         )
-        
+
+        # --- 3. 空间恢复模块  ---
+        self.spatial_expander = nn.Sequential(
+            nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=4),
+            nn.GroupNorm(32, dim)
+        )
+
     def forward(
-        self,
-        current_latents: torch.Tensor,  # [B, T, H, W, D] - 当前帧潜在表示
-        text_embeds: torch.Tensor,  # [B, D] - 文本条件
-        image_embeds: Optional[torch.Tensor] = None,  # [B, D] - 图像条件
-        history_latents: Optional[torch.Tensor] = None,  # [B, T_past, H, W, D]
-        entity_memory: Optional[torch.Tensor] = None,
+            self,
+            current_latents: torch.Tensor,  # [B, T, C, H, W]
+            text_embeds: torch.Tensor,      # [B, D]
+            image_embeds: Optional[torch.Tensor] = None,
+            history_latents: Optional[torch.Tensor] = None,
+            entity_memory: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
-        
-        B, T, H, W, D = current_latents.shape
-        
-        # 展平空间维度用于推理
-        current_flat = rearrange(current_latents, 'b t h w d -> b (t h w) d')
-        
-        # 准备历史上下文
+
+        B, T, C, H, W = current_latents.shape
+
+        # --- 步骤 1: 空间压缩 ---
+        # 合并 Batch 和 Time 以便进行 2D 卷积
+        x_flat = rearrange(current_latents, 'b t c h w -> (b t) c h w')
+        x_reduced = self.spatial_reducer(x_flat) # [(B T), C, H/4, W/4]
+
+        # 展平用于 Transformer 风格的推理模块
+        # 现在序列长度减少了 16 倍！
+        current_flat = rearrange(x_reduced, 'bt c h w -> bt (h w) c')
+        # 恢复 Batch 维度用于推理: [B, (T * h_small * w_small), D]
+        current_flat = rearrange(current_flat, '(b t) s c -> b (t s) c', b=B)
+
+        # --- 步骤 2: 准备上下文 ---
+        # 注意：History Latents 也需要经过同样的压缩，为了简单起见，这里假设 history 已经被压缩
+        # 或者我们只用 Global Average Pooling 的 context
         if history_latents is not None:
-            history_flat = rearrange(history_latents, 'b t h w d -> b (t h w) d')
-            context = history_flat.mean(dim=1, keepdim=True).expand_as(current_flat)
+            # 简化处理：对历史帧做全局平均，作为 context
+            context = history_latents.mean(dim=[2, 3, 4]).unsqueeze(1).expand(B, current_flat.shape[1], -1)
         else:
             context = torch.zeros_like(current_flat)
-        
-        # 1. 物理推理
+
+        # --- 步骤 3: 核心推理---
+
+        # 3.1 物理推理
         physics_reasoned = self.physics_memory(current_flat, context)
-        
-        # 2. 常识推理
+
+        # 3.2 常识推理
         condition = text_embeds if image_embeds is None else (text_embeds + image_embeds) / 2
         commonsense_reasoned, plausibility = self.commonsense_reasoning(
             current_flat, condition
         )
-        
-        # 3. 一致性推理
+
+        # 3.3 一致性推理
         consistent_reasoned, new_entity_memory = self.consistency_module(
             current_flat, entity_memory
         )
-        
-        # 自适应融合三种推理结果
-        combined = torch.stack([
-            physics_reasoned,
-            commonsense_reasoned,
-            consistent_reasoned
-        ], dim=-1)  # [B, T*H*W, D, 3]
-        
+
+        # --- 步骤 4: 融合 ---
+        combined = torch.stack([physics_reasoned, commonsense_reasoned, consistent_reasoned], dim=-1)
+
+        # 计算门控
         gate_input = torch.cat([
             physics_reasoned.mean(dim=1),
             commonsense_reasoned.mean(dim=1),
             consistent_reasoned.mean(dim=1),
-        ], dim=-1)  # [B, D*3]
-        
-        gates = self.adaptive_gate(gate_input)  # [B, 3]
+        ], dim=-1)
+
+        gates = self.adaptive_gate(gate_input)
         gates = rearrange(gates, 'b g -> b 1 1 g')
-        
-        fused = (combined * gates).sum(dim=-1)  # [B, T*H*W, D]
-        
-        # 深度融合
+
+        fused = (combined * gates).sum(dim=-1)
+
         for layer in self.fusion_layers:
             fused = fused + layer(fused)
-        
-        # 恢复空间维度
-        reasoned_latents = rearrange(
-            fused, 'b (t h w) d -> b t h w d', t=T, h=H, w=W
-        )
-        
+
+        # --- 步骤 5: 空间恢复 ---
+        # [B, (T * h * w), C] -> [(B T), C, h, w]
+        h_small, w_small = H // 4, W // 4
+        fused_img = rearrange(fused, 'b (t h w) c -> (b t) c h w', t=T, h=h_small, w=w_small)
+
+        # 上采样回原始尺寸
+        reasoned_latents = self.spatial_expander(fused_img)
+
+        # 恢复原始维度结构
+        reasoned_latents = rearrange(reasoned_latents, '(b t) c h w -> b t c h w', b=B)
+
+        # 此时 reasoned_latents 的形状应该与输入 current_latents 完全一致
+
         aux_outputs = {
             'plausibility': plausibility,
             'entity_memory': new_entity_memory,
             'fusion_gates': gates,
         }
-        
+
         return reasoned_latents, aux_outputs
