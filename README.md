@@ -2,10 +2,10 @@
 
 ```bash
 # 推理（生成视频）
-python titans_video_generation.py --mode inference
+python train.py --mode inference
 
 # 训练
-python titans_video_generation.py --mode train
+python train.py --mode train
 ```
 
 **注意事项：**
